@@ -517,5 +517,5 @@ if __name__ == "__main__":
     import uvicorn
 
     host = os.environ.get("HOST", "127.0.0.1")
-    port = int(os.environ.get("PORT", "8000"))
+    port = int(os.environ.get("PORT", "8001"))
     uvicorn.run("proxy:app", host=host, port=port, reload=False)
