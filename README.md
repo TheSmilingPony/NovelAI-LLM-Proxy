@@ -1,4 +1,4 @@
-Local proxy to handle NovelAI's GLM 4.6 / Xialong model not sending non-streaming responses in a format SillyTavern (and other frontends) can parse. Useful for certain extensions.
+Local proxy to handle NovelAI's GLM 4.6 / Xialong model not sending non-streaming responses in a format SillyTavern (and other frontends) can parse. Useful for certain extensions. Also fixes logprob support.
 
 Run setup to create the venv, create a .env file using the example with your NAI token, and the run the proxy.
 
