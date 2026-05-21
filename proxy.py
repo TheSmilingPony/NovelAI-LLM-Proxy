@@ -33,7 +33,7 @@ AVAILABLE_MODELS = os.environ.get("AVAILABLE_MODELS", "")
 
 if not NOVELAI_API_KEY:
     raise RuntimeError(
-        "Set NOVELAI_API_KEY in .env (copy .env.example) or in your environment before starting the proxy"
+        "Set NOVELAI_API_KEY in .env (copy env.example) or in your environment before starting the proxy"
     )
 
 
@@ -84,8 +84,22 @@ def novelai_headers() -> dict[str, str]:
     }
 
 
+def normalize_logprobs_param(body: dict[str, Any]) -> None:
+    """Normalize logprobs from boolean (OpenAI standard) to integer (NovelAI expects int).
+
+    SillyTavern sends ``logprobs: true`` (boolean), but NovelAI's OpenAI-compatible API
+    expects an integer specifying how many top logprobs to return per token.
+    """
+    logprobs = body.get("logprobs")
+    if logprobs is True:
+        body["logprobs"] = 1
+    elif logprobs is False:
+        body["logprobs"] = 0
+
+
 def build_novelai_body(body: dict[str, Any], *, stream: bool) -> dict[str, Any]:
     payload = dict(body)
+    normalize_logprobs_param(payload)
     payload["model"] = normalize_model(payload.get("model"))
     payload["stream"] = stream
 
@@ -114,6 +128,21 @@ def extract_stream_text(chunk: dict[str, Any]) -> str:
 
     message = choice.get("message") or {}
     return message.get("content") or ""
+
+
+def extract_stream_logprobs(chunk: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Extract per-token logprobs from a streaming chunk's first choice, if present."""
+    choices = chunk.get("choices") or []
+    if not choices:
+        return None
+    choice = choices[0]
+    logprobs = choice.get("logprobs")
+    if logprobs is None:
+        return None
+    content = logprobs.get("content")
+    if not content:
+        return None
+    return content
 
 
 def normalize_chat_stream_chunk(chunk: dict[str, Any], fallback_model: str) -> dict[str, Any] | None:
@@ -293,11 +322,12 @@ async def chat_streaming_response(
 async def stream_novelai_text(
     client: httpx.AsyncClient,
     payload: dict[str, Any],
-) -> tuple[str, str | None, str, dict[str, Any] | None]:
+) -> tuple[str, str | None, str, dict[str, Any] | None, list[dict[str, Any]] | None]:
     completion_id: str | None = None
     model = payload.get("model", DEFAULT_MODEL)
     usage: dict[str, Any] | None = None
     full_text = ""
+    logprobs: list[dict[str, Any]] | None = None
 
     async for event_type, chunk in iter_novelai_sse(client, NOVELAI_CHAT_URL, payload):
         if event_type == "done":
@@ -308,8 +338,13 @@ async def stream_novelai_text(
         if chunk.get("usage"):
             usage = chunk["usage"]
         full_text += extract_stream_text(chunk)
+        chunk_logprobs = extract_stream_logprobs(chunk)
+        if chunk_logprobs is not None:
+            if logprobs is None:
+                logprobs = []
+            logprobs.extend(chunk_logprobs)
 
-    return full_text, completion_id, model, usage
+    return full_text, completion_id, model, usage, logprobs
 
 
 def openai_chat_response(
@@ -317,6 +352,7 @@ def openai_chat_response(
     completion_id: str | None,
     model: str,
     usage: dict[str, Any] | None,
+    logprobs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     return {
         "id": completion_id or f"chatcmpl-{uuid.uuid4()}",
@@ -330,7 +366,7 @@ def openai_chat_response(
                     "role": "assistant",
                     "content": content,
                 },
-                "logprobs": None,
+                "logprobs": {"content": logprobs} if logprobs else None,
                 "finish_reason": "stop",
             }
         ],
@@ -407,7 +443,7 @@ async def chat_completions(request: Request):
 
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
-            full_text, completion_id, model, usage = await stream_novelai_text(client, payload)
+            full_text, completion_id, model, usage, logprobs = await stream_novelai_text(client, payload)
     except HTTPException:
         raise
     except httpx.RequestError as exc:
@@ -416,7 +452,7 @@ async def chat_completions(request: Request):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return JSONResponse(
-        openai_chat_response(full_text, completion_id, model or requested_model, usage)
+        openai_chat_response(full_text, completion_id, model or requested_model, usage, logprobs)
     )
 
 
@@ -450,6 +486,7 @@ async def completions(request: Request):
     client_stream = bool(body.get("stream"))
 
     payload = dict(body)
+    normalize_logprobs_param(payload)
     payload["model"] = requested_model
     payload["stream"] = True
 
@@ -473,6 +510,7 @@ async def completions(request: Request):
     full_text = ""
     completion_id: str | None = None
     usage: dict[str, Any] | None = None
+    logprobs: list[dict[str, Any]] | None = None
 
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
@@ -484,6 +522,11 @@ async def completions(request: Request):
                 if chunk.get("usage"):
                     usage = chunk["usage"]
                 full_text += extract_stream_text(chunk)
+                chunk_logprobs = extract_stream_logprobs(chunk)
+                if chunk_logprobs is not None:
+                    if logprobs is None:
+                        logprobs = []
+                    logprobs.extend(chunk_logprobs)
     except HTTPException:
         raise
     except httpx.RequestError as exc:
@@ -500,7 +543,7 @@ async def completions(request: Request):
                     "index": 0,
                     "text": full_text,
                     "finish_reason": "stop",
-                    "logprobs": None,
+                    "logprobs": {"content": logprobs} if logprobs else None,
                 }
             ],
             "usage": usage
@@ -517,5 +560,5 @@ if __name__ == "__main__":
     import uvicorn
 
     host = os.environ.get("HOST", "127.0.0.1")
-    port = int(os.environ.get("PORT", "8001"))
+    port = int(os.environ.get("PORT", "8000"))
     uvicorn.run("proxy:app", host=host, port=port, reload=False)
