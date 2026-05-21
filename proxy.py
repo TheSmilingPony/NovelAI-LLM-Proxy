@@ -27,6 +27,7 @@ app = FastAPI(title="NAIProxy")
 
 NOVELAI_API_BASE = os.environ.get("NOVELAI_API_BASE", "https://text.novelai.net").rstrip("/")
 NOVELAI_CHAT_URL = f"{NOVELAI_API_BASE}/oa/v1/chat/completions"
+NOVELAI_COMPLETIONS_URL = f"{NOVELAI_API_BASE}/oa/v1/completions"
 NOVELAI_API_KEY = os.environ.get("NOVELAI_API_KEY", "")
 DEFAULT_MODEL = "glm-4-6"
 AVAILABLE_MODELS = os.environ.get("AVAILABLE_MODELS", "")
@@ -84,22 +85,80 @@ def novelai_headers() -> dict[str, str]:
     }
 
 
-def normalize_logprobs_param(body: dict[str, Any]) -> None:
-    """Normalize logprobs from boolean (OpenAI standard) to integer (NovelAI expects int).
+def resolve_logprobs_count(body: dict[str, Any]) -> int:
+    """Determine the integer logprobs count to request from NovelAI's completions endpoint.
 
-    SillyTavern sends ``logprobs: true`` (boolean), but NovelAI's OpenAI-compatible API
-    expects an integer specifying how many top logprobs to return per token.
+    NovelAI's `/oa/v1/completions` endpoint (powered by vLLM) accepts ``logprobs`` as an
+    integer N, returning top N+1 candidate tokens per position.
+
+    Priority:
+      1. ``top_logprobs: N`` (from client) → use N.
+      2. ``logprobs: <int>`` (from client) → use the integer value.
+      3. ``logprobs: true`` (Python bool) → default to ``5`` (a reasonable number).
+      4. Otherwise → ``0`` (no logprobs requested).
+
+    Note: ``bool`` is a subclass of ``int`` in Python, so ``isinstance(True, int)``
+    is ``True``.  We must check for ``bool`` *before* ``int``.
     """
+    top_logprobs = body.get("top_logprobs")
+    if top_logprobs is not None:
+        return max(1, int(top_logprobs))
     logprobs = body.get("logprobs")
-    if logprobs is True:
-        body["logprobs"] = 1
-    elif logprobs is False:
-        body["logprobs"] = 0
+    if isinstance(logprobs, bool):
+        return 5 if logprobs else 0
+    if isinstance(logprobs, int) and logprobs > 0:
+        return logprobs
+    return 0
+
+
+def convert_completions_logprobs(
+    comp_lp: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Convert completions-style logprobs to chat.completion.chunk style.
+
+    Completions format (per chunk):
+      ``{"tokens": [" to"], "token_logprobs": [-0.048], "top_logprobs": [{" to": -0.048}]}``
+
+    Chat format (per chunk):
+      ``{"content": [{"token": " to", "logprob": -0.048, "bytes": null, "top_logprobs": [...]}]}``
+    """
+    if not comp_lp:
+        return None
+    tokens = comp_lp.get("tokens") or []
+    token_logprobs = comp_lp.get("token_logprobs") or []
+    top_logprobs_list = comp_lp.get("top_logprobs") or []
+
+    content: list[dict[str, Any]] = []
+    for i, token in enumerate(tokens):
+        logprob = token_logprobs[i] if i < len(token_logprobs) else 0.0
+        top_dict = top_logprobs_list[i] if i < len(top_logprobs_list) else {}
+
+        # Build top_logprobs entries for this token position
+        top_entries: list[dict[str, Any]] = []
+        for t_token, t_logprob in top_dict.items():
+            top_entries.append({
+                "token": t_token,
+                "logprob": t_logprob,
+                "bytes": None,
+            })
+
+        content.append({
+            "token": token,
+            "logprob": logprob,
+            "bytes": None,
+            "top_logprobs": top_entries,
+        })
+
+    return {"content": content}
 
 
 def build_novelai_body(body: dict[str, Any], *, stream: bool) -> dict[str, Any]:
     payload = dict(body)
-    normalize_logprobs_param(payload)
+    # Remove unsupported params
+    payload.pop("top_logprobs", None)
+    # Strip boolean logprobs (chat endpoint rejects JSON booleans)
+    if isinstance(payload.get("logprobs"), bool):
+        payload.pop("logprobs", None)
     payload["model"] = normalize_model(payload.get("model"))
     payload["stream"] = stream
 
@@ -131,7 +190,12 @@ def extract_stream_text(chunk: dict[str, Any]) -> str:
 
 
 def extract_stream_logprobs(chunk: dict[str, Any]) -> list[dict[str, Any]] | None:
-    """Extract per-token logprobs from a streaming chunk's first choice, if present."""
+    """Extract per-token logprobs from a streaming chunk's first choice.
+
+    Handles both formats:
+    - Chat format: ``logprobs.content[{token, logprob, bytes, top_logprobs}]``
+    - Completions format: ``logprobs.{tokens, token_logprobs, top_logprobs}``
+    """
     choices = chunk.get("choices") or []
     if not choices:
         return None
@@ -139,10 +203,39 @@ def extract_stream_logprobs(chunk: dict[str, Any]) -> list[dict[str, Any]] | Non
     logprobs = choice.get("logprobs")
     if logprobs is None:
         return None
+
+    # Chat format: content array with {token, logprob, ...}
     content = logprobs.get("content")
-    if not content:
+    if content:
+        return content
+
+    # Completions format: parallel arrays {tokens, token_logprobs, top_logprobs}
+    tokens = logprobs.get("tokens") or []
+    token_logprobs = logprobs.get("token_logprobs") or []
+    top_logprobs_list = logprobs.get("top_logprobs") or []
+
+    if not tokens:
         return None
-    return content
+
+    result: list[dict[str, Any]] = []
+    for i, token in enumerate(tokens):
+        logprob = token_logprobs[i] if i < len(token_logprobs) else 0.0
+        top_dict = top_logprobs_list[i] if i < len(top_logprobs_list) else {}
+        top_entries: list[dict[str, Any]] = []
+        for t_token, t_logprob in top_dict.items():
+            top_entries.append({
+                "token": t_token,
+                "logprob": t_logprob,
+                "bytes": None,
+            })
+        result.append({
+            "token": token,
+            "logprob": logprob,
+            "bytes": None,
+            "top_logprobs": top_entries,
+        })
+
+    return result
 
 
 def normalize_chat_stream_chunk(chunk: dict[str, Any], fallback_model: str) -> dict[str, Any] | None:
@@ -182,6 +275,11 @@ def normalize_chat_stream_chunk(chunk: dict[str, Any], fallback_model: str) -> d
     if text:
         delta["content"] = text
 
+    # Convert completions-style logprobs to chat format when source is a
+    # completions chunk (has "text" instead of "delta")
+    raw_logprobs = choice.get("logprobs")
+    chat_logprobs = convert_completions_logprobs(raw_logprobs) if raw_logprobs else raw_logprobs
+
     return {
         "id": completion_id,
         "object": "chat.completion.chunk",
@@ -192,7 +290,7 @@ def normalize_chat_stream_chunk(chunk: dict[str, Any], fallback_model: str) -> d
                 "index": choice.get("index", 0),
                 "delta": delta,
                 "finish_reason": finish_reason,
-                "logprobs": choice.get("logprobs"),
+                "logprobs": chat_logprobs,
             }
         ],
         **({"usage": chunk["usage"]} if chunk.get("usage") else {}),
@@ -298,8 +396,11 @@ async def open_novelai_stream(
 async def chat_streaming_response(
     payload: dict[str, Any],
     fallback_model: str,
+    *,
+    use_completions: bool = False,
 ) -> StreamingResponse:
-    client, response = await open_novelai_stream(NOVELAI_CHAT_URL, payload)
+    upstream = NOVELAI_COMPLETIONS_URL if use_completions else NOVELAI_CHAT_URL
+    client, response = await open_novelai_stream(upstream, payload)
 
     async def cleanup_wrapper() -> AsyncIterator[bytes]:
         try:
@@ -322,14 +423,17 @@ async def chat_streaming_response(
 async def stream_novelai_text(
     client: httpx.AsyncClient,
     payload: dict[str, Any],
+    *,
+    use_completions: bool = False,
 ) -> tuple[str, str | None, str, dict[str, Any] | None, list[dict[str, Any]] | None]:
+    upstream = NOVELAI_COMPLETIONS_URL if use_completions else NOVELAI_CHAT_URL
     completion_id: str | None = None
     model = payload.get("model", DEFAULT_MODEL)
     usage: dict[str, Any] | None = None
     full_text = ""
     logprobs: list[dict[str, Any]] | None = None
 
-    async for event_type, chunk in iter_novelai_sse(client, NOVELAI_CHAT_URL, payload):
+    async for event_type, chunk in iter_novelai_sse(client, upstream, payload):
         if event_type == "done":
             break
         assert chunk is not None
@@ -431,11 +535,35 @@ async def chat_completions(request: Request):
     requested_model = normalize_model(body.get("model"))
     client_stream = bool(body.get("stream"))
 
-    payload = build_novelai_body(body, stream=True)
+    logprobs_count = resolve_logprobs_count(body)
+
+    if logprobs_count > 0:
+        # Use /oa/v1/completions endpoint which accepts logprobs as integer
+        # (vLLM returns N+1 top candidates per token position).
+        # Convert chat messages to a prompt for the completions endpoint.
+        payload = dict(body)
+        payload["model"] = requested_model
+        payload["stream"] = True
+        payload.pop("messages", None)
+        payload.pop("top_logprobs", None)
+        payload.pop("logprobs", None)
+        payload["logprobs"] = logprobs_count
+        if body.get("messages"):
+            payload["prompt"] = messages_to_prompt(body["messages"])
+        elif not payload.get("prompt"):
+            raise HTTPException(status_code=400, detail="Request must include messages or prompt")
+        # Ensure no leftover boolean logprobs in completions payload
+        if isinstance(payload.get("logprobs"), bool):
+            payload.pop("logprobs", None)
+            payload["logprobs"] = max(1, logprobs_count)
+        use_completions = True
+    else:
+        payload = build_novelai_body(body, stream=True)
+        use_completions = False
 
     if client_stream:
         try:
-            return await chat_streaming_response(payload, requested_model)
+            return await chat_streaming_response(payload, requested_model, use_completions=use_completions)
         except HTTPException:
             raise
         except httpx.RequestError as exc:
@@ -443,7 +571,9 @@ async def chat_completions(request: Request):
 
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
-            full_text, completion_id, model, usage, logprobs = await stream_novelai_text(client, payload)
+            full_text, completion_id, model, usage, logprobs = await stream_novelai_text(
+                client, payload, use_completions=use_completions
+            )
     except HTTPException:
         raise
     except httpx.RequestError as exc:
@@ -486,7 +616,9 @@ async def completions(request: Request):
     client_stream = bool(body.get("stream"))
 
     payload = dict(body)
-    normalize_logprobs_param(payload)
+    # Remove unsupported params and resolve integer logprobs count
+    payload.pop("top_logprobs", None)
+    payload["logprobs"] = resolve_logprobs_count(body)
     payload["model"] = requested_model
     payload["stream"] = True
 
@@ -560,5 +692,5 @@ if __name__ == "__main__":
     import uvicorn
 
     host = os.environ.get("HOST", "127.0.0.1")
-    port = int(os.environ.get("PORT", "8000"))
+    port = int(os.environ.get("PORT", "8001"))
     uvicorn.run("proxy:app", host=host, port=port, reload=False)
